@@ -10,7 +10,7 @@ from wenet.transformer.attention import MultiHeadedAttention
 from wenet.transformer.decoder_layer import DecoderLayer
 from wenet.transformer.embedding import PositionalEncoding
 from wenet.transformer.positionwise_feed_forward import PositionwiseFeedForward
-from wenet.utils.mask import subsequent_mask, make_pad_mask
+from wenet.utils.mask import subsequent_mask, make_pad_mask, subsequent_mask_right_to_left, make_pad_mask_right
 
 
 class TransformerDecoder(torch.nn.Module):
@@ -41,6 +41,7 @@ class TransformerDecoder(torch.nn.Module):
         attention_heads: int = 4,
         linear_units: int = 2048,
         num_blocks: int = 6,
+        r_num_blocks: int = 0,
         dropout_rate: float = 0.1,
         positional_dropout_rate: float = 0.1,
         self_attention_dropout_rate: float = 0.0,
@@ -60,15 +61,22 @@ class TransformerDecoder(torch.nn.Module):
                 torch.nn.Embedding(vocab_size, attention_dim),
                 PositionalEncoding(attention_dim, positional_dropout_rate),
             )
+            self.right_embed = torch.nn.Sequential(
+                torch.nn.Embedding(vocab_size, attention_dim),
+                PositionalEncoding(attention_dim, positional_dropout_rate),
+            )
         else:
             raise ValueError(
                 f"only 'embed' is supported: {input_layer}")
 
         self.normalize_before = normalize_before
         self.after_norm = torch.nn.LayerNorm(attention_dim, eps=1e-12)
+        self.right_after_norm = torch.nn.LayerNorm(attention_dim, eps=1e-12)
         self.use_output_layer = use_output_layer
         self.output_layer = torch.nn.Linear(attention_dim, vocab_size)
-
+        self.right_output_layer = torch.nn.Linear(attention_dim, vocab_size)
+        self.num_blocks = num_blocks
+        self.r_num_blocks = r_num_blocks
         self.decoders = torch.nn.ModuleList([
             DecoderLayer(
                 attention_dim,
@@ -81,7 +89,21 @@ class TransformerDecoder(torch.nn.Module):
                 dropout_rate,
                 normalize_before,
                 concat_after,
-            ) for _ in range(num_blocks)
+            ) for _ in range(self.num_blocks)
+        ])
+        self.right_decoders = torch.nn.ModuleList([
+            DecoderLayer(
+                attention_dim,
+                MultiHeadedAttention(attention_heads, attention_dim,
+                                     self_attention_dropout_rate),
+                MultiHeadedAttention(attention_heads, attention_dim,
+                                     src_attention_dropout_rate),
+                PositionwiseFeedForward(attention_dim, linear_units,
+                                        dropout_rate),
+                dropout_rate,
+                normalize_before,
+                concat_after,
+            ) for _ in range(self.r_num_blocks)
         ])
 
     def forward(
@@ -90,7 +112,8 @@ class TransformerDecoder(torch.nn.Module):
         memory_mask: torch.Tensor,
         ys_in_pad: torch.Tensor,
         ys_in_lens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r_ys_in_pad: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """Forward decoder.
 
         Args:
@@ -105,25 +128,50 @@ class TransformerDecoder(torch.nn.Module):
                 olens: (batch, )
         """
         tgt = ys_in_pad
+        r_tgt = r_ys_in_pad
         # tgt_mask: (B, 1, L)
         tgt_mask = (~make_pad_mask(ys_in_lens).unsqueeze(1)).to(tgt.device)
         # m: (1, L, L)
         m = subsequent_mask(tgt_mask.size(-1),
                             device=tgt_mask.device).unsqueeze(0)
         # tgt_mask: (B, L, L)
-        tgt_mask = tgt_mask & m
+        l_tgt_mask = tgt_mask & m
+        l_x, _ = self.embed(tgt)
 
-        x, _ = self.embed(tgt)
-        for layer in self.decoders:
-            x, tgt_mask, memory, memory_mask = layer(x, tgt_mask, memory,
+        r_x = None
+        if self.r_num_blocks > 0:
+            # tgt_mask: (B, 1, L)
+            r_tgt_mask = (~make_pad_mask_right(ys_in_lens).unsqueeze(1)).to(r_tgt.device)
+            # m: (1, L, L)
+            r_m = subsequent_mask_right_to_left(r_tgt_mask.size(-1),
+                            device=r_tgt_mask.device).unsqueeze(0)
+
+            # tgt_mask: (B, L, L)
+            r_tgt_mask = r_tgt_mask & r_m
+            r_x, _ = self.right_embed(r_tgt)
+
+        for l_layer in self.decoders:
+            l_x, l_tgt_mask, memory, memory_mask = l_layer(l_x, l_tgt_mask, memory,
                                                      memory_mask)
-        if self.normalize_before:
-            x = self.after_norm(x)
-        if self.use_output_layer:
-            x = self.output_layer(x)
+        for r_layer in self.right_decoders:
+            r_x, r_tgt_mask, memory, memory_mask = r_layer(r_x, r_tgt_mask, memory,
+                                                     memory_mask)
+        #for l_layer, r_layer in zip(self.decoders, self.right_decoders):
+        #    l_x, l_tgt_mask, memory, memory_mask = l_layer(l_x, l_tgt_mask, memory,
+        #                                             memory_mask)
+        #    r_x, r_tgt_mask, memory, memory_mask = r_layer(r_x, r_tgt_mask, memory,
+        #                                             memory_mask)
 
+        if self.normalize_before:
+            l_x = self.after_norm(l_x)
+            if self.r_num_blocks > 0:
+                r_x = self.right_after_norm(r_x)
+        if self.use_output_layer:
+            l_x = self.output_layer(l_x)
+            if self.r_num_blocks > 0:
+                r_x = self.right_output_layer(r_x)
         olens = tgt_mask.sum(1)
-        return x, olens
+        return l_x, r_x, olens
 
     def forward_one_step(
         self,

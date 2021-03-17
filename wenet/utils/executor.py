@@ -46,7 +46,7 @@ class Executor:
             else:
                 context = nullcontext
             with context():
-                loss, loss_att, loss_ctc = model(feats,
+                loss, loss_att, l_loss_att, r_loss_att, loss_ctc = model(feats,
                                                  feats_lengths,
                                                  target,
                                                  target_lengths)
@@ -71,6 +71,10 @@ class Executor:
                     loss.item() * accum_grad)
                 if loss_att is not None:
                     log_str += 'loss_att {:.6f} '.format(loss_att.item())
+                if l_loss_att is not None:
+                    log_str += 'l_loss_att {:.6f} '.format(l_loss_att.item())
+                if r_loss_att is not None:
+                    log_str += 'r_loss_att {:.6f} '.format(r_loss_att.item())
                 if loss_ctc is not None:
                     log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
                 log_str += 'lr {:.8f} rank {}'.format(lr, rank)
@@ -94,7 +98,7 @@ class Executor:
                 num_utts = target_lengths.size(0)
                 if num_utts == 0:
                     continue
-                loss, loss_att, loss_ctc = model(feats, feats_lengths, target,
+                loss, loss_att, l_loss_att, r_loss_att,loss_ctc = model(feats, feats_lengths, target, 
                                                  target_lengths)
                 if torch.isfinite(loss):
                     num_seen_utts += num_utts
@@ -104,6 +108,10 @@ class Executor:
                         batch_idx, num_total_batch, loss.item())
                     if loss_att is not None:
                         log_str += 'loss_att {:.6f} '.format(loss_att.item())
+                    if l_loss_att is not None:
+                        log_str += 'l_loss_att {:.6f} '.format(l_loss_att.item())
+                    if r_loss_att is not None:
+                        log_str += 'r_loss_att {:.6f} '.format(r_loss_att.item())
                     if loss_ctc is not None:
                         log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
                     log_str += 'history loss {:.6f}'.format(

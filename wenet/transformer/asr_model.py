@@ -27,7 +27,8 @@ from wenet.transformer.encoder import TransformerEncoder
 from wenet.transformer.label_smoothing_loss import LabelSmoothingLoss
 from wenet.utils.cmvn import load_cmvn
 from wenet.utils.common import (IGNORE_ID, add_sos_eos, log_add,
-                                remove_duplicates_and_blank, th_accuracy)
+                                remove_duplicates_and_blank, th_accuracy,
+                                add_eos_sos)
 from wenet.utils.mask import (make_pad_mask, mask_finished_preds,
                               mask_finished_scores, subsequent_mask)
 
@@ -71,7 +72,7 @@ class ASRModel(torch.nn.Module):
         speech_lengths: torch.Tensor,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Frontend + Encoder + Decoder + Calc loss
 
         Args:
@@ -91,11 +92,16 @@ class ASRModel(torch.nn.Module):
 
         # 2a. Attention-decoder branch
         if self.ctc_weight != 1.0:
-            loss_att, acc_att = self._calc_att_loss(encoder_out, encoder_mask,
+            l_loss_att, r_loss_att, acc_att = self._calc_att_loss(encoder_out, encoder_mask,
                                                     text, text_lengths)
+            if r_loss_att is not None:
+                loss_att = l_loss_att *0.7 + 0.3* r_loss_att
+            else:
+                loss_att = l_loss_att
         else:
             loss_att = None
-
+            l_loss_att = None
+            r_loss_att = None
         # 2b. CTC branch
         if self.ctc_weight != 0.0:
             loss_ctc = self.ctc(encoder_out, encoder_out_lens, text, text_lengths)
@@ -109,7 +115,7 @@ class ASRModel(torch.nn.Module):
         else:
             loss = self.ctc_weight * loss_ctc + (1 -
                                                  self.ctc_weight) * loss_att
-        return loss, loss_att, loss_ctc
+        return loss, loss_att, l_loss_att, r_loss_att, loss_ctc
 
     def _calc_att_loss(
         self,
@@ -117,23 +123,30 @@ class ASRModel(torch.nn.Module):
         encoder_mask: torch.Tensor,
         ys_pad: torch.Tensor,
         ys_pad_lens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, float]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], float]:
         ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos,
                                             self.ignore_id)
+        r_ys_in_pad = None
+        if self.decoder.r_num_blocks > 0:
+            r_ys_in_pad, r_ys_out_pad = add_eos_sos(ys_pad, self.sos, self.eos,
+                                                    self.ignore_id)
         ys_in_lens = ys_pad_lens + 1
 
         # 1. Forward decoder
-        decoder_out, _ = self.decoder(encoder_out, encoder_mask, ys_in_pad,
-                                      ys_in_lens)
+        decoder_out, r_decoder_out, _ = self.decoder(encoder_out, encoder_mask, ys_in_pad,
+                                      ys_in_lens, r_ys_in_pad)
 
         # 2. Compute attention loss
-        loss_att = self.criterion_att(decoder_out, ys_out_pad)
+        l_loss_att = self.criterion_att(decoder_out, ys_out_pad)
+        r_loss_att = None
+        if r_decoder_out is not None:            
+            r_loss_att = self.criterion_att(r_decoder_out, r_ys_out_pad)
         acc_att = th_accuracy(
             decoder_out.view(-1, self.vocab_size),
             ys_out_pad,
             ignore_label=self.ignore_id,
         )
-        return loss_att, acc_att
+        return l_loss_att, r_loss_att, acc_att
 
     def _forward_encoder(
         self,
@@ -436,6 +449,7 @@ class ASRModel(torch.nn.Module):
         num_decoding_left_chunks: int = -1,
         ctc_weight: float = 0.0,
         simulate_streaming: bool = False,
+        reverse_weight: float = 0.0
     ) -> List[int]:
         """ Apply attention rescoring decoding, CTC prefix beam search
             is applied first to get nbest, then we resoring the nbest on
@@ -475,7 +489,9 @@ class ASRModel(torch.nn.Module):
         hyps_lens = torch.tensor([len(hyp[0]) for hyp in hyps],
                                  device=device,
                                  dtype=torch.long)  # (beam_size,)
-        hyps_pad, _ = add_sos_eos(hyps_pad, self.sos, self.eos, self.ignore_id)
+        l_hyps_pad, _ = add_sos_eos(hyps_pad, self.sos, self.eos, self.ignore_id)
+        r_hyps_pad, _ = add_eos_sos(hyps_pad, self.sos, self.eos,
+                                            self.ignore_id)
         hyps_lens = hyps_lens + 1  # Add <sos> at begining
         encoder_out = encoder_out.repeat(beam_size, 1, 1)
         encoder_mask = torch.ones(beam_size,
@@ -483,19 +499,32 @@ class ASRModel(torch.nn.Module):
                                   encoder_out.size(1),
                                   dtype=torch.bool,
                                   device=device)
-        decoder_out, _ = self.decoder(
-            encoder_out, encoder_mask, hyps_pad,
-            hyps_lens)  # (beam_size, max_hyps_len, vocab_size)
+        decoder_out, r_decoder_out, _ = self.decoder(
+            encoder_out, encoder_mask, l_hyps_pad,
+            hyps_lens, r_hyps_pad)  # (beam_size, max_hyps_len, vocab_size)
         decoder_out = torch.nn.functional.log_softmax(decoder_out, dim=-1)
         decoder_out = decoder_out.cpu().numpy()
+        r_decoder_out = torch.nn.functional.log_softmax(r_decoder_out, dim=-1)
+        r_decoder_out = r_decoder_out.cpu().numpy()
         # Only use decoder score for rescoring
         best_score = -float('inf')
         best_index = 0
         for i, hyp in enumerate(hyps):
             score = 0.0
+            r_score = 0.0
             for j, w in enumerate(hyp[0]):
                 score += decoder_out[i][j][w]
+            # skip padding part, find real start
+            t = 0
+            for j, w in enumerate(r_hyps_pad[i]):
+                if w == self.eos:
+                    t = t+1
+                else:
+                    break
+            for j, w in enumerate(hyp[0]):
+                r_score += r_decoder_out[i][j+1+t][w]
             score += decoder_out[i][len(hyp[0])][self.eos]
+            score = (score * (1-reverse_weight)) + (r_score * reverse_weight)
             # add ctc score
             score += hyp[1] * ctc_weight
             if score > best_score:
@@ -602,8 +631,8 @@ class ASRModel(torch.nn.Module):
                                   encoder_out.size(1),
                                   dtype=torch.bool,
                                   device=encoder_out.device)
-        decoder_out, _ = self.decoder(
-            encoder_out, encoder_mask, hyps,
+        decoder_out, _,  _ = self.decoder(
+            encoder_out, encoder_mask, hyps, hyps,
             hyps_lens)  # (num_hyps, max_hyps_len, vocab_size)
         decoder_out = torch.nn.functional.log_softmax(decoder_out, dim=-1)
         return decoder_out
